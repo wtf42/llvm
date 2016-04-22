@@ -16,15 +16,11 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
 
+#include "llvm/IR/InstIterator.h"
+
 using namespace llvm;
 
 
-std::string fctx_begin = ""
-"define void @ir_func() #0 {\n"
-"entry:\n";
-std::string fctx_end = "\n"
-"ret void\n"
-"}\n";
 
 struct InlineAssemblyVisitor
   : public InstVisitor<InlineAssemblyVisitor>
@@ -39,46 +35,85 @@ struct InlineAssemblyVisitor
     if (!CI.isInlineAsm()){
       return;
     }
-    dbgs() << "Visit " << CI << "\n";
-    //dbgs().flush();
-    for (auto it = CI.op_begin(); it != CI.op_end(); ++it) {
-      if (InlineAsm *s = dyn_cast<InlineAsm>(it->get())) {
-        //if (s->getDialect() != s->AD_IR) continue;
+    for (auto &ciOp : CI.operands()) {
+      if (InlineAsm *iasm = dyn_cast<InlineAsm>(ciOp)) {
+        //if (iasm->getDialect() != s->AD_IR) continue;
 
-        Module *M = CI.getModule();
-        //Function *F = CI.getFunction();
-        //llvm::getGlobalContext()
+        //Module *M = CI.getModule();
+        Function *F = CI.getFunction();
+        LLVMContext &FC = F->getContext();
 
-        const std::string& asm_str = s->getAsmString();
-        dbgs() << asm_str << "\n";
-        std::string module_str = fctx_begin + asm_str + fctx_end;
+        std::string tempFuncName = "ir_func";
+        std::string entryStr = "entry";
 
-        llvm::SMDiagnostic Error;
-        auto &&Mod = parseAssemblyString(module_str, Error, M->getContext());
-        if (!Mod) {
+        auto emptyFuncMod = make_unique<Module>("ir_inline_asm", getGlobalContext());
+        Type *retType = CI.getType();
+        Function *emptyFunc = cast<Function>(emptyFuncMod->getOrInsertFunction(tempFuncName, retType, NULL));
+        for (auto &arg : CI.arg_operands()) {
+          new llvm::Argument(arg->getType(), "", emptyFunc);
+        }
+        IRBuilder<> Builder(emptyFuncMod->getContext());
+        BasicBlock *BB = BasicBlock::Create(emptyFuncMod->getContext(), entryStr, emptyFunc);
+        Builder.SetInsertPoint(BB);
+        if (retType->isVoidTy()) {
+          Builder.CreateRetVoid();
+        }
+
+        std::string modStr;
+        raw_string_ostream modStream(modStr);
+        modStream << *emptyFuncMod;
+        modStream.flush();
+
+        std::string asm_str = iasm->getAsmString();
+        std::string entryInsertStr = entryStr + ":";
+        size_t entryPos = modStr.find(entryInsertStr);
+        if (entryPos == std::string::npos) {
+          llvm::report_fatal_error("can't find entry");
+          return;
+        }
+        modStr.insert(entryPos + entryInsertStr.length(), "\n" + asm_str);
+        //dbgs() << "module:\n" << modStr << "\n\n";
+
+        SMDiagnostic Error;
+        auto parsedFuncMod = parseAssemblyString(modStr, Error, getGlobalContext());
+        if (!parsedFuncMod) {
           std::string ErrMsg;
-          llvm::raw_string_ostream Errs(ErrMsg);
-          Errs << "failed to parse inline assembly:" << "\n";
-          Errs << std::string(Error.getMessage()) << "\n";
+          raw_string_ostream Errs(ErrMsg);
+          Errs << "failed to parse inline assembly:\n";
+          Errs << Error.getMessage() << "\n";
           Errs << "line " << Error.getLineNo() << "\n";
-          Errs << std::string(Error.getLineContents()) << "\n";
+          Errs << Error.getLineContents() << "\n";
           llvm::report_fatal_error(Errs.str());
           return;
         }
-        llvm::Linker::linkModules(*M, std::move(Mod));
+        Function* parsedFunc = parsedFuncMod->getFunction(tempFuncName);
 
-        StringRef fname("ir_func");
-        Function *f_new = static_cast<llvm::Function*>(M->getFunction(fname));
-        FunctionType *f_type = f_new->getFunctionType();
-        ArrayRef<Value*> args;
-        CallInst *inst = CallInst::Create(f_type, f_new, args);
-        inst->insertAfter(&CI);
-        CI.removeFromParent();
+        std::vector<Use*> fargs;
+        for (auto &src_it : CI.operands()) {
+          fargs.push_back(&src_it);
+        }
 
-        //IRBuilder<> builder(F->getContext());
-        //CallInst *instr2 = builder.CreateCall(f_new, args);
-        //instr2->insertBefore(&CI);
-        //instr2->insertAfter(&CI);
+        for (inst_iterator I = inst_begin(parsedFunc), E = inst_end(parsedFunc); I != E; ++I) {
+          if (dyn_cast<ReturnInst>(&*I)) {
+            //TODO: replace assignment
+            break;
+          }
+          Instruction *i = I->clone();
+          I->replaceAllUsesWith(i);
+          if (I->hasName()) {
+            i->setName(I->getName());
+          }
+          for (auto &op : i->operands()) {
+            if (Argument *arg = dyn_cast<Argument>(op)) {
+              if (arg->getParent() == parsedFunc) {
+                op = *fargs[arg->getArgNo()];
+              }
+            }
+          }
+          i->setMetadata("ir_asm", MDNode::get(FC, MDString::get(FC, "some useful info")));
+          i->insertBefore(&CI);
+        }
+        CI.eraseFromParent();
         modified = true;
       }
     }
@@ -89,12 +124,13 @@ struct InlineAssemblyVisitor
 
 struct InlineAssembly2 : public FunctionPass {
   static char ID;
-  InlineAssembly2() : FunctionPass(ID) {}
+  InlineAssembly2()
+    : FunctionPass(ID)
+  {}
 
   virtual bool runOnFunction(Function &F) {
     InlineAssemblyVisitor visitor;
     visitor.visit(F);
-    //dbgs() << F.getName() << ":\n" << F << "\n";
     return visitor.modified;
   }
 };
