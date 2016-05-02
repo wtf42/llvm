@@ -93,10 +93,21 @@ struct InlineAssemblyVisitor
           fargs.push_back(&src_it);
         }
 
+        bool hasReturnInst = false;
         for (inst_iterator I = inst_begin(parsedFunc), E = inst_end(parsedFunc); I != E; ++I) {
-          if (dyn_cast<ReturnInst>(&*I)) {
-            //TODO: replace assignment
-            break;
+          if (ReturnInst* ret = dyn_cast<ReturnInst>(&*I)) {
+            if (hasReturnInst) {
+              llvm::report_fatal_error("ir inline asm should have only one return instruction");
+            }
+            if (ret->getNumOperands() != 1) {
+              llvm::report_fatal_error("ir inline asm should have one return operand");
+            }
+            auto op = ret->op_begin()->get();
+            if (!op->getType()->isVoidTy()) {
+              CI.replaceAllUsesWith(op);
+            }
+            hasReturnInst = true;
+            continue;
           }
           Instruction *i = I->clone();
           I->replaceAllUsesWith(i);
